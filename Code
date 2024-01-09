@@ -1,1 +1,70 @@
+Datafactory Pipe line code: 
+Retrieve table names from local SQL Server 
+SELECT
+s.name AS SchemaName, load schema name
+t.name AS TableName   load Table name
+FROM sys.tables t     direct to database 
+INNER Join sys.schemas s join the schemas
+on t.schema_id = s.schema_id
+WHERE s.name='SalesLT'  only select those starting with SalesLT 
+
+Retrieve the actual values passed from the first step
+ForEach: @activity('Look_all_Tables').output.value For each retrieved table name the output value is captured 
+
+Combine the retrieved values 
+ForEach: @{concat('SELECT * FROM ', item().SchemaName, '.',item().TableName)} This is called from wihtin the loop of step 2 and copies the data to storage 
+
+Databricks Mounting code: 
+storageAccountName = "storageaccountetl"
+storageAccountAccessKey = "Dont think so"
+blobContainerName = "bronze"  ## Set this to the value of the created container within Azure Storage
+mountPoint = "/mnt/bronze/"
+if not any(mount.mountPoint == mountPoint for mount in dbutils.fs.mounts()):
+  try:
+    dbutils.fs.mount(
+      source = "wasbs://{}@{}.blob.core.windows.net".format(blobContainerName, storageAccountName),
+      mount_point = mountPoint,
+      extra_configs = {'fs.azure.account.key.' + storageAccountName + '.blob.core.windows.net': storageAccountAccessKey}  
+      
+    )
+    print("mount succeeded!")
+  except Exception as e:
+    print("mount exception", e)
+
+Databricks Transformation code: 
+Step 1: setting date format
+table_name = []
+
+for i in dbutils.fs.ls('mnt/bronze/SalesLT/'):
+    table_name.append(i.name.split('/')[0])
+from pyspark.sql.functions import from_utc_timestamp, date_format 
+from pyspark.sql.types import TimestampType 
+
+for i in table_name: 
+    path = '/mnt/bronze/SalesLT/' + i + '/' + i + '.parquet'
+    df = spark.read.format('parquet').load(path)
+    column = df.columns
+    for col in column:
+        if "Date" in col or "date" in col: 
+            df = df.withColumn(col, date_format(from_utc_timestamp(df[col].cast(TimestampType()), 'UTC'), 'yyyy-MM-dd'))
+    output_path = '/mnt/silver/SalesLT/' + i + '/'
+    df.write.format('delta').mode('overwrite').save(output_path) 
+    
+Step 2: setting naming conventions
+for name in table_name: 
+    path = '/mnt/silver/SalesLT/' + name 
+    print(path)
+    df = spark.read.format('delta').load(path)
+    
+    column_names = df.columns
+
+    for old_col_name in column_names: 
+        new_col_name = "".join(["_" + char if char.isupper() and not old_col_name[i - 1].isupper() else char for i, char in enumerate(old_col_name)]).lstrip("_")
+        
+        df = df.withColumnRenamed(old_col_name, new_col_name)
+        
+    output_path = '/mnt/workaroundcsv' + name + '/'
+    df.write.format('parquet').mode('overwrite').save(output_path)
+    
+
 
