@@ -1,1 +1,77 @@
+A brief process description of moving the Adventure Works database from local SQL to the Azure cloud and eventually loading the data for reporting. 
 
+Extract
+Data has been extracted from local SQL server using a link with Azure Datafactory and SHIR. 
+The following pipeline has been used: 
+1. In-built Look up function in order to retrieve all tables from the local SQL Database
+code: SELECT\ns.name AS SchemaName, \nt.name AS TableName\nFROM sys.tables t \nINNER Join sys.schemas s \non t.schema_id = s.schema_id\nWHERE s.name='SalesLT'
+2. In-built ForEach loop which goes over every name retrieved by Look up and gets the actual table values 
+code: @activity('Look_all_Tables').output.value
+3. Inner ForEach loop which combines all the table values, retrieved by the outer ForEach loop. 
+code: @{concat('SELECT * FROM ', item().SchemaName, '.',item().TableName)}
+
+Transform
+In order to get the data into the right format Databricks has been connected with the Azure Datalake Storage.
+code: Mounting without Credential Passthrough
+storageAccountName = "storageaccountetl"
+storageAccountAccessKey = XYZ
+sasToken = <sas-token>
+blobContainerName = "bronze"
+mountPoint = "/mnt/data/"
+if not any(mount.mountPoint == mountPoint for mount in dbutils.fs.mounts()):
+  try:
+    dbutils.fs.mount(
+      source = "wasbs://{}@{}.blob.core.windows.net".format(blobContainerName, storageAccountName),
+      mount_point = mountPoint,
+      extra_configs = {'fs.azure.account.key.' + storageAccountName + '.blob.core.windows.net': storageAccountAccessKey}
+      #extra_configs = {'fs.azure.sas.' + blobContainerName + '.' + storageAccountName + '.blob.core.windows.net': sasToken}
+    )
+    print("mount succeeded!")
+  except Exception as e:
+    print("mount exception", e)
+
+Transformation has been done in three steps: bronze: raw data, silver: tranforming time formats, gold: transforming table names
+To Silver: 
+from pyspark.sql.functions import from_utc_timestamp, date_format 
+from pyspark.sql.types import TimestampType 
+
+for i in table_name: 
+    path = '/mnt/bronze/SalesLT/' + i + '/' + i + '.parquet'
+    df = spark.read.format('parquet').load(path)
+    column = df.columns
+    for col in column:
+        if "Date" in col or "date" in col: 
+            df = df.withColumn(col, date_format(from_utc_timestamp(df[col].cast(TimestampType()), 'UTC'), 'yyyy-MM-dd'))
+    output_path = '/mnt/silver/SalesLT/' + i + '/'
+    df.write.format('delta').mode('overwrite').save(output_path) 
+To Gold: 
+for name in table_name: 
+    path = '/mnt/silver/SalesLT/' + name 
+    print(path)
+    df = spark.read.format('delta').load(path)
+    
+    column_names = df.columns
+
+    for old_col_name in column_names: 
+        new_col_name = "".join(["_" + char if char.isupper() and not old_col_name[i - 1].isupper() else char for i, char in enumerate(old_col_name)]).lstrip("_")
+        
+        df = df.withColumnRenamed(old_col_name, new_col_name)
+        
+    output_path = '/mnt/workaroundcsv' + name + '/'
+    df.write.format('delta').mode('overwrite').save(output_path)
+These tranformations have been written wihtin Databricks notebooks and subsequently connected to the Datafactory pipeline. Which leads to the final pipeline: 
+
+1. In-built Look up function in order to retrieve all tables from the local SQL Database
+code: SELECT\ns.name AS SchemaName, \nt.name AS TableName\nFROM sys.tables t \nINNER Join sys.schemas s \non t.schema_id = s.schema_id\nWHERE s.name='SalesLT'
+2. In-built ForEach loop which goes over every name retrieved by Look up and gets the actual table values 
+code: @activity('Look_all_Tables').output.value
+3. Inner ForEach loop which combines all the table values, retrieved by the outer ForEach loop. 
+code: @{concat('SELECT * FROM ', item().SchemaName, '.',item().TableName)}
+4. Retrieve raw data from Datalake through a Databricks mount
+5. Transform date format and save in Datalake Storage
+6. Transform table names and save in Datalake Storage 
+
+Load
+Since Azure does not allow the use of Synapse service in the Student Subscription this aspect will not be completed untill a workaround has been found. Untill then! 
+
+    
